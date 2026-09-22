@@ -1,0 +1,6 @@
+.venv/
+profile/
+logs/
+state.json
+auth.json
+scratch/
