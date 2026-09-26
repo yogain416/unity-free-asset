@@ -87,6 +87,9 @@ def launch(p, headed):
     )
     if AUTH.exists():
         ctx.add_cookies(json.loads(AUTH.read_text(encoding="utf-8"))["cookies"])
+    # pay.unity.com 쿠키에 끝내지 못한 옛 주문이 붙어 있으면 체크아웃이 그 주문을 되살린다(retry_flag).
+    # 로그인은 .unity.com 쿠키라 결제 사이트 쿠키는 매번 지워도 된다.
+    ctx.clear_cookies(domain="pay.unity.com")
     return ctx
 
 
@@ -139,11 +142,31 @@ def do_login(p):
         sys.exit(1)
 
 
+def main_button(page):
+    """에셋 페이지 상단의 메인 버튼. Unity가 UI를 바꿔 가며 셋 중 하나로 나온다:
+    'Buy Now'(바로 체크아웃) / 'Add to Cart'(장바구니 다이얼로그) / 'Open in Unity'(이미 보유)."""
+    loc = (
+        page.get_by_role("button", name="Buy Now", exact=True)
+        .or_(page.locator("[data-test=product-detail-add-to-cart-button]"))
+        .or_(page.locator("#product-detail-add-to-cart-button-v2 button"))
+        .or_(page.get_by_role("button", name=re.compile("open in unity", re.I)))
+    ).first
+    loc.wait_for(timeout=30_000)
+    return loc
+
+
+def button_label(btn):
+    return ((btn.inner_text() or "").strip() or (btn.get_attribute("aria-label") or "")).strip()
+
+
 def open_cart_and_checkout(page):
-    # 상단의 메인 버튼만 누른다 ("Add to Cart" 또는 이미 담겨 있으면 "View In Cart"). 관련 에셋의 버튼은 건드리지 않는다.
     before = page.url
-    page.locator("[data-test=product-detail-add-to-cart-button]").first.click(timeout=30_000)
-    page.locator("[data-test=checkout-button]").first.click(timeout=30_000)
+    btn = main_button(page)
+    label = button_label(btn)
+    btn.click(timeout=30_000)
+    if not re.search("buy now", label, re.I):
+        # 장바구니 다이얼로그가 뜨는 옛 방식: Checkout 을 한 번 더 누른다
+        page.locator("[data-test=checkout-button]").first.click(timeout=30_000)
     # 로그인 페이지 또는 체크아웃 페이지로 실제로 넘어갈 때까지 기다린다 (몇 초 걸림)
     try:
         page.wait_for_url(lambda u: u != before, timeout=30_000)
@@ -154,10 +177,7 @@ def open_cart_and_checkout(page):
 
 
 def is_owned(page):
-    """에셋 페이지의 메인 버튼이 'Open in Unity'면 이미 보유. 버튼이 렌더링될 때까지 기다린다."""
-    btn = page.locator("[data-test=product-detail-add-to-cart-button]").first
-    btn.wait_for(timeout=30_000)
-    return bool(re.search("open in unity", btn.inner_text(), re.I))
+    return bool(re.search("open in unity", button_label(main_button(page)), re.I))
 
 
 def find_this_weeks_gift(page):
@@ -173,10 +193,14 @@ def find_this_weeks_gift(page):
     return STORE + href, m.group(1), name
 
 
+CUR_PAGE = None
+
+
 def do_claim(p, headed):
+    global CUR_PAGE
     state = load_state()
     ctx = launch(p, headed)
-    page = ctx.pages[0]
+    page = CUR_PAGE = ctx.pages[0]
     dismiss_cookies(page)
 
     url, coupon, name = find_this_weeks_gift(page)
@@ -199,6 +223,8 @@ def do_claim(p, headed):
 
     if "login.unity.com" in page.url:
         fail(page, "로그인 세션이 만료됐습니다. `python claim.py --login` 을 다시 실행하세요.", code=2)
+    if "retry_flag=true" in page.url:
+        fail(page, "체크아웃이 끝내지 못한 옛 주문을 되살렸습니다 (retry_flag). 이번 주 에셋이 아니므로 중단.")
     log(f"체크아웃 페이지: {page.url}")
 
     # 쿠폰 입력 (모바일용/데스크톱용 입력창이 둘이라 보이는 쪽만)
@@ -221,12 +247,29 @@ def do_claim(p, headed):
         fail(page, "EULA 동의 체크가 되지 않았습니다.")
 
     page.get_by_role("button", name="Pay now").first.click(timeout=15_000)
-    page.wait_for_timeout(10_000)
-    log(f"결제 버튼 클릭 후 페이지: {page.url}")
+    try:
+        page.wait_for_url(re.compile(r"/orders/\d+/confirm"), timeout=60_000)
+    except PwTimeout:
+        fail(page, "결제 버튼을 눌렀지만 주문 확인 페이지로 넘어가지 않았습니다.")
+    page.wait_for_timeout(5000)
+    log(f"주문 확인 페이지: {page.url}")
+    confirm = page.inner_text("body")
+    if not re.search(r"open in unity", confirm, re.I) or not re.search(r"Order Total:?\s*\$0", confirm):
+        fail(page, "주문 확인 페이지에 'Open In Unity' 또는 총액 $0 이 보이지 않습니다. 주문 내역을 확인하세요.")
 
-    page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-    if not is_owned(page):
-        fail(page, "결제 후에도 에셋 페이지에 'Open in Unity'가 보이지 않습니다. 실제로 담겼는지 확인 필요.")
+    # 에셋 페이지 반영은 몇 초 늦을 수 있어 재시도
+    owned = False
+    for _ in range(3):
+        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        try:
+            owned = is_owned(page)
+        except PwTimeout:
+            owned = False
+        if owned:
+            break
+        page.wait_for_timeout(10_000)
+    if not owned:
+        log("주문은 완료됐지만 에셋 페이지가 아직 '보유'로 바뀌지 않았습니다. 주문 확인 페이지 기준으로 성공 처리.")
 
     state["claimed"].append(name)
     save_state(state)
@@ -253,6 +296,8 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as e:  # noqa: BLE001
+        if CUR_PAGE is not None:
+            fail(CUR_PAGE, f"예상 못한 오류: {e!r}"[:300])
         log(f"UNEXPECTED: {e!r}")
         notify("Unity 무료 에셋 오류", str(e)[:150])
         sys.exit(1)
