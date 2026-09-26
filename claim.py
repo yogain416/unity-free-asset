@@ -254,7 +254,7 @@ def do_claim(p, headed):
     page.wait_for_timeout(5000)
     log(f"주문 확인 페이지: {page.url}")
     confirm = page.inner_text("body")
-    if not re.search(r"open in unity", confirm, re.I) or not re.search(r"Order Total:?\s*\$0(?:\.0+)?(?!\d)", confirm):
+    if not re.search(r"open in unity", confirm, re.I) or not re.search(r"Order Total:?\s*\$0(?:\.0+)?(?![.\d])", confirm):
         fail(page, "주문 확인 페이지에 'Open In Unity' 또는 총액 $0 이 보이지 않습니다. 주문 내역을 확인하세요.")
 
     # 에셋 페이지 반영은 몇 초 늦을 수 있어 재시도
